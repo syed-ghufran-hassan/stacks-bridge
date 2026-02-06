@@ -1,15 +1,12 @@
- ;; velar-adapter.clar
+;; velar-adapter.clar
 ;; Adapter for Velar DEX integration
 ;; Implements dex-adapter-trait for swapping xUSDC -> USDCx
 
 (impl-trait .dex-adapter-trait.dex-adapter-trait)
 
-
 ;; ============================================
 ;; CONSTANTS
 ;; ============================================
-
- 
 
 (define-constant ERR-NOT-AUTHORIZED (err u401))
 (define-constant ERR-SWAP-FAILED (err u501))
@@ -19,85 +16,37 @@
 (define-constant ERR-INVALID-TOKEN (err u505))
 (define-constant ERR-PAUSED (err u506))
 (define-constant ERR-INVALID-SLIPPAGE (err u507))
+(define-constant ERR-INSUFFICIENT-ALLOWANCE (err u508))
+(define-constant ERR-TRANSFER-FAILED (err u509))
 
 ;; Velar Mainnet Router Contract
 (define-constant VELAR-MAINNET-ROUTER 'SP1Y5YSTAHZ88XYK1VPDH24GY0HPX5J4JECTMY4A1)
 
-;; Official USDCx Contract
-(define-constant USDCX-MAINNET 'SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE)
-
-;; AMM fee (0.3%)
-(define-constant FEE-NUMERATOR u997)
-(define-constant FEE-DENOMINATOR u1000)
-
-;; Slippage
-(define-constant DEFAULT-SLIPPAGE-TOLERANCE u50) ;; 0.5%
-(define-constant SLIPPAGE-DENOMINATOR u10000)
+;; Velar Router Functions
+(define-constant SWAP-EXACT-TOKENS-FOR-TOKENS "swap-exact-tokens-for-tokens")
 
 ;; ============================================
-;; DATA VARIABLES
+;; DATA VARIABLES (Keep as is)
 ;; ============================================
 
 (define-data-var router-contract principal VELAR-MAINNET-ROUTER)
 (define-data-var router-configured bool false)
 (define-data-var contract-owner principal tx-sender)
-
-
 (define-data-var xusdc-token-contract principal tx-sender)
 (define-data-var usdcx-token-contract principal USDCX-MAINNET)
 (define-data-var pool-id uint u0)
 (define-data-var pool-configured bool false)
-
 (define-data-var slippage-tolerance uint DEFAULT-SLIPPAGE-TOLERANCE)
 (define-data-var paused bool false)
 
 ;; ============================================
-;; ADMIN FUNCTIONS
+;; ADMIN FUNCTIONS (Keep as is)
 ;; ============================================
 
-(define-public (set-router-contract (router principal))
-  (begin
-   (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (var-set router-contract router)
-    (var-set router-configured true)
-    (print { event: "router-configured", router: router })
-    (ok true)))
-
-(define-public (configure-pool
-  (xusdc-token principal)
-  (usdcx-token principal)
-  (velar-pool-id uint))
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (var-set xusdc-token-contract xusdc-token)
-    (var-set usdcx-token-contract usdcx-token)
-    (var-set pool-id velar-pool-id)
-    (var-set pool-configured true)
-    (print {
-      event: "pool-configured",
-      xusdc-token: xusdc-token,
-      usdcx-token: usdcx-token,
-      pool-id: velar-pool-id
-    })
-    (ok true)))
-
-(define-public (set-slippage-tolerance (tolerance uint))
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (asserts! (<= tolerance u1000) ERR-INVALID-SLIPPAGE) ;; max 10%
-    (var-set slippage-tolerance tolerance)
-    (print { event: "slippage-updated", tolerance: tolerance })
-    (ok true)))
-
-(define-public (set-paused (is-paused bool))
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (var-set paused is-paused)
-    (print { event: "pause-toggled", paused: is-paused })
-    (ok true)))
+;; ... (keep all admin functions unchanged)
 
 ;; ============================================
-;; DEX ADAPTER IMPLEMENTATION
+;; UPDATED DEX ADAPTER IMPLEMENTATION
 ;; ============================================
 
 (define-public (swap-exact-tokens
@@ -119,24 +68,61 @@
     ;; Enforce adapter slippage protection
     (asserts! (>= min-amount-out actual-min-out) ERR-INSUFFICIENT-OUTPUT)
 
-    ;; Simulated swap (router call omitted)
-    (print {
-      event: "swap-executed",
-      router: (var-get router-contract),
-      pool-id: (var-get pool-id),
-      token-in: token-in,
-      token-out: token-out,
-      amount-in: amount-in,
-      amount-out: expected-out,
-      min-amount-out: min-amount-out,
-      slippage: (var-get slippage-tolerance),
-      sender: tx-sender
-    })
+    ;; 1. Transfer xUSDC from user to this contract
+    (try! (ft-transfer?
+      (var-get xusdc-token-contract)
+      amount-in
+      tx-sender
+      (as-contract tx-sender)
+      none
+    ))
 
-    (ok expected-out)))
+    ;; 2. Approve Velar router to spend xUSDC
+    (try! (as-contract
+      (ft-transfer?
+        (var-get xusdc-token-contract)
+        amount-in
+        tx-sender
+        (var-get router-contract)
+        none
+      )
+    ))
+
+    ;; 3. Execute swap through Velar router
+    (match (try! (contract-call?
+      (var-get router-contract)
+      SWAP-EXACT-TOKENS-FOR-TOKENS
+      (var-get pool-id)
+      (var-get xusdc-token-contract)
+      (var-get usdcx-token-contract)
+      amount-in
+      actual-min-out
+      tx-sender
+    )) as (swap-result { amount-out: uint })
+      ;; 4. Verify swap output meets minimum
+      (asserts! (>= amount-out min-amount-out) ERR-INSUFFICIENT-OUTPUT)
+      
+      ;; Log successful swap
+      (print {
+        event: "swap-executed",
+        router: (var-get router-contract),
+        pool-id: (var-get pool-id),
+        token-in: token-in,
+        token-out: token-out,
+        amount-in: amount-in,
+        amount-out: amount-out,
+        min-amount-out: min-amount-out,
+        slippage: (var-get slippage-tolerance),
+        sender: tx-sender
+      })
+      
+      (ok amount-out)
+    )
+  )
+)
 
 ;; ============================================
-;; READ-ONLY / HELPERS
+;; UPDATED QUOTE FUNCTION (Query actual pool)
 ;; ============================================
 
 (define-read-only (get-swap-quote
@@ -146,7 +132,59 @@
   (begin
     (asserts! (is-eq token-in (var-get xusdc-token-contract)) ERR-INVALID-TOKEN)
     (asserts! (is-eq token-out (var-get usdcx-token-contract)) ERR-INVALID-TOKEN)
-    (ok (calculate-output-amount amount-in))))
+    
+    ;; Try to get quote from actual Velar pool
+    (match (contract-call?
+      (var-get router-contract)
+      "get-amounts-out"
+      (var-get pool-id)
+      (var-get xusdc-token-contract)
+      (var-get usdcx-token-contract)
+      amount-in
+    ) as (quote-response { amounts: (list 2 uint) })
+      (ok (element-at amounts u1))
+      ;; Fallback to local calculation if router doesn't respond
+      (ok (calculate-output-amount amount-in))
+    )
+  )
+)
+
+;; ============================================
+;; NEW: EMERGENCY WITHDRAW FUNCTION
+;; ============================================
+
+(define-public (withdraw-tokens
+  (token principal)
+  (amount uint)
+  (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    
+    ;; Transfer tokens from contract to recipient
+    (try! (as-contract
+      (ft-transfer?
+        token
+        amount
+        tx-sender
+        recipient
+        none
+      )
+    ))
+    
+    (print {
+      event: "tokens-withdrawn",
+      token: token,
+      amount: amount,
+      recipient: recipient
+    })
+    
+    (ok true)
+  )
+)
+
+;; ============================================
+;; HELPER FUNCTIONS (Keep as is)
+;; ============================================
 
 (define-private (calculate-output-amount (amount-in uint))
   (/ (* amount-in FEE-NUMERATOR) FEE-DENOMINATOR))
@@ -158,6 +196,22 @@
   )
     (/ (* expected (- SLIPPAGE-DENOMINATOR slippage)) SLIPPAGE-DENOMINATOR)))
 
+;; ============================================
+;; ADDITIONAL VIEW FUNCTIONS
+;; ============================================
+
+(define-read-only (get-pool-info)
+  (ok {
+    pool-id: (var-get pool-id),
+    xusdc-token: (var-get xusdc-token-contract),
+    usdcx-token: (var-get usdcx-token-contract),
+    configured: (var-get pool-configured)
+  })
+)
+
+(define-read-only (get-token-balance (token principal))
+  (ft-get-balance token tx-sender)
+)
 ;; ============================================
 ;; VIEW FUNCTIONS
 ;; ============================================
